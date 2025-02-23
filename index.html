@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Excel-Like Dynamic Table (Cleaned Up)</title>
+  <style>
+    /* A scrollable container so the table can expand horizontally if needed */
+    .table-wrapper {
+      overflow-x: auto;
+      border: 1px solid #ccc;
+      margin: 20px 0;
+      max-width: 100%;
+    }
+
+    table {
+      border-collapse: collapse;
+      table-layout: fixed; /* widths come from <colgroup> */
+      min-width: 900px;
+      width: 100%;
+      font-family: sans-serif;
+    }
+
+    th, td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: center;
+      position: relative;
+      white-space: nowrap;
+      /* user-select: none;   <-- Removed so you can select text if needed */
+    }
+
+    th {
+      background-color: #f4f4f4;
+      user-select: none;  /* It's okay to keep headers unselectable */
+    }
+
+    /* The inputs inside cells remain fully editable */
+    td input {
+      width: 90%;
+      padding: 4px;
+      box-sizing: border-box;
+      user-select: text; /* So you can select text inside the input */
+    }
+
+    /* Icon styles */
+    .icon {
+      cursor: pointer;
+      margin: 0 3px;
+    }
+
+    /* Column resizer handle (draggable area on the right edge of the header) */
+    .resizer {
+      position: absolute;
+      right: 0;
+      top: 0;
+      width: 5px;
+      cursor: col-resize;
+      user-select: none;
+      height: 100%;
+    }
+
+    /* Drag icon for row reordering */
+    .drag-icon {
+      cursor: move; /* row only becomes draggable while holding this icon */
+      padding: 4px 6px;
+      border: 1px solid #ccc;
+      background: #eee;
+      border-radius: 4px;
+    }
+    .drag-icon:hover {
+      background: #ddd;
+    }
+
+    /* The Actions cell's layout (drag icon, row checkbox, trash icon) */
+    .action-container {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    tr.dragging {
+      opacity: 0.5;
+    }
+    tr.over {
+      border: 2px dashed #000;
+    }
+
+    /* Header layout for label & icons in one row, filter below */
+    .header-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .th-label {
+      font-weight: bold;
+      margin-right: 5px;
+    }
+    .th-icons {
+      display: inline-flex;
+      gap: 5px;
+    }
+    .header-filter {
+      margin-top: 4px;
+    }
+
+    /* Highlight selected cells for the drag-to-select behavior */
+    .selected-cell {
+      background-color: #c8e6c9; /* light green highlight */
+    }
+
+    /* The small panel for showing sum/avg/count, etc. */
+    #selection-summary {
+      position: fixed;
+      bottom: 10px;
+      right: 10px;
+      background: #fdfdfd;
+      border: 1px solid #ccc;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 14px;
+      display: none; /* hidden if no cells selected */
+      white-space: pre;
+      z-index: 9999;
+    }
+  </style>
+</head>
+<body>
+  <h2>Excel-Like Dynamic Table (Cleaned Up)</h2>
+  <div id="table-container" class="table-wrapper"></div>
+
+  <!-- Selection summary panel (bottom-right) -->
+  <div id="selection-summary"></div>
+
+  <script>
+    /******************************************************************
+     * Global table config (user-defined columns).
+     * pinned/frozen => pinned columns appear leftmost, frozen can't be pinned at same time
+     * hasTot / hasAvg => numeric columns show totals/avg in the footer
+     ******************************************************************/
+    const tbl = [
+      { type: 'text',   label: 'Name', ML: 21, pinned: false, frozen: false, width: 150 },
+      { type: 'number', label: 'Age',  MN: 100, hasTot: true, hasAvg: true, pinned: false, frozen: false, width: 150 },
+      { type: 'text',   label: 'City', ML: 30,  pinned: false, frozen: false, width: 150 }
+    ];
+
+    let rowId = 0;
+
+    // For Excel-like "click-and-drag" cell selection
+    let isSelectingCells = false;
+    let anchorCell = null;    // {rowId, colId}
+    let lastHoverCell = null; // last cell we hovered over while dragging
+    const selectedCells = new Set(); // store 'rowId_colId' for each selected cell
+
+    /******************************************************************
+     * 1) Pin/Freeze logic
+     ******************************************************************/
+    function getUserColumnOrder() {
+      // pinned first (sorted by pinTimestamp), then others
+      const pinned = [];
+      const nonPinned = [];
+      tbl.forEach((col, idx) => {
+        if (col.pinned) pinned.push({ idx, time: col.pinTimestamp || Date.now() });
+        else nonPinned.push(idx);
+      });
+      pinned.sort((a,b) => a.time - b.time);
+      return pinned.map(item => item.idx).concat(nonPinned);
+    }
+
+    function togglePin(i) {
+      tbl[i].pinned = !tbl[i].pinned;
+      if (tbl[i].pinned) {
+        tbl[i].frozen = false; // can't be both
+        tbl[i].pinTimestamp = Date.now();
+      }
+      rebuildTablePreservingData();
+    }
+    function toggleFreeze(i) {
+      tbl[i].frozen = !tbl[i].frozen;
+      if (tbl[i].frozen) tbl[i].pinned = false;
+      rebuildTablePreservingData();
+    }
+
+    /******************************************************************
+     * 2) Building & Rebuilding the Table
+     ******************************************************************/
+    function rebuildTablePreservingData() {
+      // Save current row data
+      const tbody = document.querySelector('tbody');
+      const rowsData = [];
+      if (tbody) {
+        const rows = tbody.querySelectorAll('tr.dataRow');
+        rows.forEach(row => {
+          const rowObj = {};
+          for (let i = 1; i < row.cells.length - 1; i++) {
+            const cell = row.cells[i];
+            const origIndex = cell.getAttribute('data-col');
+            if (origIndex !== null) {
+              const input = cell.querySelector('input');
+              rowObj[origIndex] = input ? input.value : "";
+            }
+          }
+          rowObj._rowId = row.id;
+          rowsData.push(rowObj);
+        });
+      }
+      createTable();  // rebuild the structure
+      // Re-inject the row data
+      rowsData.forEach(data => addRowWithData(data));
+      updateSerialNumbers();
+      updateFooter();
+
+      // reset selection
+      clearSelection();
+      updateSelectionSummary();
+    }
+
+    function createTable() {
+      const userOrder = getUserColumnOrder();
+      const container = document.getElementById('table-container');
+      container.innerHTML = '';
+
+      const table = document.createElement('table');
+      table.id = 'dynamicTable';
+
+      // Build <colgroup>
+      const colgroup = document.createElement('colgroup');
+      // S.No. column (always leftmost, always frozen)
+      const snoCol = document.createElement('col');
+      snoCol.style.width = '50px';
+      colgroup.appendChild(snoCol);
+      // user-defined
+      userOrder.forEach(i => {
+        const colElem = document.createElement('col');
+        colElem.style.width = tbl[i].width + 'px';
+        colgroup.appendChild(colElem);
+      });
+      // actions (always rightmost, always frozen)
+      const actionCol = document.createElement('col');
+      actionCol.style.width = '100px';
+      colgroup.appendChild(actionCol);
+
+      table.appendChild(colgroup);
+
+      // thead
+      const thead = document.createElement('thead');
+      const headerRow = document.createElement('tr');
+
+      // S.No. header
+      const snoTh = document.createElement('th');
+      snoTh.textContent = 'S.No.';
+      snoTh.setAttribute('data-col','sno');
+      headerRow.appendChild(snoTh);
+
+      // user-defined headers
+      userOrder.forEach(i => {
+        const col = tbl[i];
+        const th = document.createElement('th');
+        th.setAttribute('data-col', i);
+
+        // top row (label + icons)
+        const headerTop = document.createElement('div');
+        headerTop.className = 'header-top';
+
+        const labelSpan = document.createElement('span');
+        labelSpan.className = 'th-label';
+        labelSpan.textContent = col.label;
+
+        const iconsSpan = document.createElement('span');
+        iconsSpan.className = 'th-icons';
+
+        // search icon
+        const searchIcon = document.createElement('span');
+        searchIcon.className = 'icon search-icon';
+        searchIcon.textContent = '🔍';
+
+        // pin icon
+        const pinIcon = document.createElement('span');
+        pinIcon.className = 'icon pin-icon';
+        pinIcon.textContent = col.pinned ? '📍' : '📌';
+        pinIcon.onclick = () => togglePin(i);
+
+        // freeze icon
+        const freezeIcon = document.createElement('span');
+        freezeIcon.className = 'icon freeze-icon';
+        freezeIcon.textContent = col.frozen ? '⛄' : '❄️';
+        freezeIcon.onclick = () => toggleFreeze(i);
+
+        iconsSpan.appendChild(searchIcon);
+        iconsSpan.appendChild(pinIcon);
+        iconsSpan.appendChild(freezeIcon);
+
+        headerTop.appendChild(labelSpan);
+        headerTop.appendChild(iconsSpan);
+
+        // filter row
+        const filterDiv = document.createElement('div');
+        filterDiv.className = 'header-filter';
+        const filterInput = document.createElement('input');
+        filterInput.type = col.type;
+        filterInput.placeholder = 'Filter';
+        filterInput.oninput = filterTable;
+        filterDiv.appendChild(filterInput);
+
+        th.appendChild(headerTop);
+        th.appendChild(filterDiv);
+
+        // resizer handle
+        const resizer = document.createElement('div');
+        resizer.className = 'resizer';
+        resizer.addEventListener('mousedown', initResize);
+        th.appendChild(resizer);
+
+        headerRow.appendChild(th);
+      });
+
+      // actions header
+      const actionTh = document.createElement('th');
+      const actionContainer = document.createElement('div');
+      actionContainer.className = 'action-container';
+
+      const plusIcon = document.createElement('span');
+      plusIcon.className = 'icon';
+      plusIcon.style.fontSize = '20px';
+      plusIcon.innerHTML = '➕';
+      plusIcon.onclick = addRow;
+
+      const headerCheckbox = document.createElement('input');
+      headerCheckbox.type = 'checkbox';
+      headerCheckbox.onclick = toggleAllAction;
+
+      const headerTrash = document.createElement('span');
+      headerTrash.className = 'icon';
+      headerTrash.style.fontSize = '20px';
+      headerTrash.innerHTML = '🗑️';
+      headerTrash.onclick = bulkDelete;
+
+      actionContainer.appendChild(plusIcon);
+      actionContainer.appendChild(headerCheckbox);
+      actionContainer.appendChild(headerTrash);
+      actionTh.appendChild(actionContainer);
+      headerRow.appendChild(actionTh);
+
+      thead.appendChild(headerRow);
+      table.appendChild(thead);
+
+      // tbody
+      const tbody = document.createElement('tbody');
+      table.appendChild(tbody);
+
+      // tfoot
+      const tfoot = document.createElement('tfoot');
+      const footerRow = document.createElement('tr');
+      // S.No. footer cell
+      footerRow.appendChild(document.createElement('td'));
+      // user-defined footers
+      userOrder.forEach(i => {
+        const col = tbl[i];
+        const td = document.createElement('td');
+        if (col.type === 'number' && (col.hasTot || col.hasAvg)) {
+          const footerInput = document.createElement('input');
+          footerInput.type = 'text';
+          footerInput.readOnly = true;
+          footerInput.id = 'footer-' + i;
+          td.appendChild(footerInput);
+        }
+        footerRow.appendChild(td);
+      });
+      // actions footer cell
+      footerRow.appendChild(document.createElement('td'));
+      tfoot.appendChild(footerRow);
+      table.appendChild(tfoot);
+
+      container.appendChild(table);
+
+      updateColumnPositions();
+
+      // Table-level mouse events for cell "drag-to-select"
+      table.addEventListener('mousedown', handleTableMouseDown);
+      table.addEventListener('mousemove', handleTableMouseMove);
+      table.addEventListener('mouseup',   handleTableMouseUp);
+      table.addEventListener('mouseleave', handleTableMouseLeave);
+    }
+
+    /******************************************************************
+     * 3) Add / Remove Rows
+     ******************************************************************/
+    function addRow() {
+      addRowWithData({});
+      updateSerialNumbers();
+      updateFooter();
+    }
+
+    function addRowWithData(data) {
+      const tbody = document.querySelector('tbody');
+      const row = document.createElement('tr');
+      row.className = 'dataRow';
+      row.id = data._rowId || ('row-' + (++rowId));
+
+      // By default, row is not draggable unless user is pressing drag icon
+      row.draggable = false;
+
+      // S.No. cell
+      const snoTd = document.createElement('td');
+      row.appendChild(snoTd);
+
+      // user-defined columns
+      const userOrder = getUserColumnOrder();
+      userOrder.forEach(i => {
+        const td = document.createElement('td');
+        td.setAttribute('data-col', i);
+        td.setAttribute('data-row', row.id);
+
+        const input = document.createElement('input');
+        input.type = tbl[i].type;
+        if (tbl[i].ML) input.maxLength = tbl[i].ML;
+        if (tbl[i].MN) input.max = tbl[i].MN;
+        if (tbl[i].type === 'number') {
+          input.oninput = updateFooter;
+        }
+        if (data.hasOwnProperty(i)) {
+          input.value = data[i];
+        }
+        td.appendChild(input);
+        row.appendChild(td);
+      });
+
+      // Actions cell
+      const actTd = document.createElement('td');
+      const actDiv = document.createElement('div');
+      actDiv.className = 'action-container';
+
+      // Drag icon
+      const dragIcon = document.createElement('span');
+      dragIcon.className = 'drag-icon';
+      dragIcon.textContent = '⇅';
+      // On mousedown => row becomes draggable
+      dragIcon.addEventListener('mousedown', () => {
+        row.draggable = true;
+      });
+      // On mouseup => disable row dragging
+      dragIcon.addEventListener('mouseup', () => {
+        setTimeout(() => {
+          row.draggable = false;
+        }, 50);
+      });
+
+      // Row checkbox
+      const rowCheckbox = document.createElement('input');
+      rowCheckbox.type = 'checkbox';
+      rowCheckbox.className = 'row-checkbox';
+
+      // Trash icon
+      const trashIcon = document.createElement('span');
+      trashIcon.className = 'icon';
+      trashIcon.style.fontSize = '16px';
+      trashIcon.textContent = '🗑️';
+      trashIcon.onclick = () => removeRow(row.id);
+
+      actDiv.appendChild(dragIcon);
+      actDiv.appendChild(rowCheckbox);
+      actDiv.appendChild(trashIcon);
+      actTd.appendChild(actDiv);
+      row.appendChild(actTd);
+
+      // Row-level drag & drop
+      row.addEventListener('dragstart', handleDragStart);
+      row.addEventListener('dragover',  handleDragOver);
+      row.addEventListener('dragenter', handleDragEnter);
+      row.addEventListener('dragleave', handleDragLeave);
+      row.addEventListener('drop',      handleDrop);
+      row.addEventListener('dragend',   handleDragEnd);
+
+      tbody.appendChild(row);
+    }
+
+    function removeRow(id) {
+      const row = document.getElementById(id);
+      if (row) {
+        row.remove();
+        updateSerialNumbers();
+        updateFooter();
+        // remove any selected cells from that row
+        [...selectedCells].forEach(key => {
+          const [r,c] = key.split('_');
+          if (r === id) selectedCells.delete(key);
+        });
+        updateSelectionSummary();
+      }
+    }
+
+    function updateSerialNumbers() {
+      const rows = document.querySelectorAll('tbody tr.dataRow');
+      rows.forEach((row, index) => {
+        row.cells[0].textContent = index + 1;
+      });
+    }
+
+    /******************************************************************
+     * 4) Bulk Delete
+     ******************************************************************/
+    function toggleAllAction(e) {
+      const checked = e.target.checked;
+      document.querySelectorAll('tbody .row-checkbox').forEach(cb => {
+        cb.checked = checked;
+      });
+    }
+
+    function bulkDelete() {
+      const rows = document.querySelectorAll('tbody tr.dataRow');
+      const toDelete = [];
+      const snoList = [];
+      rows.forEach(row => {
+        const cb = row.querySelector('.row-checkbox');
+        if (cb && cb.checked) {
+          toDelete.push(row);
+          snoList.push(row.cells[0].textContent);
+        }
+      });
+      if (toDelete.length === 0) return;
+      if (confirm(`Are you sure to delete the rows ${snoList.join(', ')}?`)) {
+        toDelete.forEach(r => r.remove());
+        updateSerialNumbers();
+        updateFooter();
+        // remove from selectedCells
+        toDelete.forEach(r => {
+          const rid = r.id;
+          [...selectedCells].forEach(key => {
+            if (key.startsWith(rid + '_')) selectedCells.delete(key);
+          });
+        });
+        updateSelectionSummary();
+      }
+    }
+
+    /******************************************************************
+     * 5) Filtering & Footer Totals/Avg
+     ******************************************************************/
+    function filterTable() {
+      const userOrder = getUserColumnOrder();
+      const headerRow = document.querySelector('thead tr');
+      userOrder.forEach((origIndex, j) => {
+        const th = headerRow.cells[j + 1];
+        const filterInput = th.querySelector('.header-filter input');
+        const filterValue = filterInput ? filterInput.value.toLowerCase() : '';
+        document.querySelectorAll('tbody tr.dataRow').forEach(row => {
+          const cell = row.querySelector(`td[data-col="${origIndex}"]`);
+          if (cell) {
+            const input = cell.querySelector('input');
+            const cellVal = input ? input.value.toLowerCase() : '';
+            if (filterValue && cellVal.indexOf(filterValue) === -1) {
+              row.style.display = 'none';
+            } else {
+              if (row.style.display !== 'none') {
+                row.style.display = '';
+              }
+            }
+          }
+        });
+      });
+      updateFooter();
+      updateSerialNumbers();
+    }
+
+    function updateFooter() {
+      const userOrder = getUserColumnOrder();
+      const rows = document.querySelectorAll('tbody tr.dataRow');
+      userOrder.forEach(origIndex => {
+        const col = tbl[origIndex];
+        if (col.type === 'number' && (col.hasTot || col.hasAvg)) {
+          let total = 0, count = 0;
+          rows.forEach(row => {
+            if (row.style.display === 'none') return;
+            const cell = row.querySelector(`td[data-col="${origIndex}"]`);
+            if (cell) {
+              const input = cell.querySelector('input');
+              let val = parseFloat(input.value);
+              if (isNaN(val) && input.value.trim() === '') {
+                // treat empty numeric cell as 0
+                val = 0;
+              }
+              if (!isNaN(val)) {
+                total += val;
+                count++;
+              }
+            }
+          });
+          const footerInput = document.getElementById('footer-' + origIndex);
+          if (footerInput) {
+            if (col.hasTot && col.hasAvg) {
+              const avg = count ? (total / count).toFixed(2) : 0;
+              footerInput.value = `Tot: ${total}, Avg: ${avg}`;
+            } else if (col.hasTot) {
+              footerInput.value = total;
+            } else if (col.hasAvg) {
+              const avg = count ? (total / count).toFixed(2) : 0;
+              footerInput.value = avg;
+            }
+          }
+        }
+      });
+    }
+
+    /******************************************************************
+     * 6) Drag & Drop Rows (only from the drag icon)
+     ******************************************************************/
+    let dragSrcRow = null;
+    function handleDragStart(e) {
+      // only triggered if row.draggable = true (set by the drag icon's mousedown)
+      dragSrcRow = this;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', this.id);
+      this.classList.add('dragging');
+    }
+    function handleDragOver(e) {
+      e.preventDefault();
+      return false;
+    }
+    function handleDragEnter(e) {
+      this.classList.add('over');
+    }
+    function handleDragLeave(e) {
+      this.classList.remove('over');
+    }
+    function handleDrop(e) {
+      e.stopPropagation();
+      const srcId = e.dataTransfer.getData('text/plain');
+      const srcRow = document.getElementById(srcId);
+      if (srcRow !== this) {
+        const tbody = document.querySelector('tbody');
+        let rows = Array.from(tbody.querySelectorAll('tr.dataRow'));
+        const srcIndex = rows.indexOf(srcRow);
+        const targetIndex = rows.indexOf(this);
+        if (srcIndex < targetIndex) {
+          tbody.insertBefore(srcRow, this.nextSibling);
+        } else {
+          tbody.insertBefore(srcRow, this);
+        }
+      }
+      updateSerialNumbers();
+      return false;
+    }
+    function handleDragEnd(e) {
+      this.classList.remove('dragging');
+      document.querySelectorAll('tr.dataRow').forEach(row => row.classList.remove('over'));
+    }
+
+    /******************************************************************
+     * 7) Column Resizing
+     ******************************************************************/
+    let startX, currentTh, startWidth;
+    function initResize(e) {
+      // If user clicked on the resizer handle in the header, start column resizing
+      currentTh = e.target.parentElement; // the <th>
+      const dataCol = currentTh.getAttribute('data-col');
+      if (dataCol === null || dataCol === 'sno') return; // skip S.No. header
+      const origIndex = parseInt(dataCol);
+      startX = e.pageX;
+      const table = document.getElementById('dynamicTable');
+      const colgroup = table.querySelector('colgroup');
+      const userOrder = getUserColumnOrder();
+      const pos = userOrder.indexOf(origIndex);
+      if (pos === -1) return;
+      currentTh._resizingCol = colgroup.children[pos + 1];
+      startWidth = tbl[origIndex].width;
+      document.addEventListener('mousemove', resizeColumn);
+      document.addEventListener('mouseup', stopResize);
+    }
+    function resizeColumn(e) {
+      if (!currentTh || !currentTh._resizingCol) return;
+      let newWidth = startWidth + (e.pageX - startX);
+      newWidth = Math.max(newWidth, 50);
+      currentTh._resizingCol.style.width = newWidth + 'px';
+      const origIndex = parseInt(currentTh.getAttribute('data-col'));
+      tbl[origIndex].width = newWidth;
+      updateColumnPositions();
+    }
+    function stopResize(e) {
+      document.removeEventListener('mousemove', resizeColumn);
+      document.removeEventListener('mouseup', stopResize);
+      currentTh = null;
+    }
+
+    function updateColumnPositions() {
+      // Position pinned/frozen columns to the left
+      const table = document.getElementById('dynamicTable');
+      if (!table) return;
+      const userOrder = getUserColumnOrder();
+      const theadRow = table.querySelector('thead tr');
+      const tbodyRows = table.querySelectorAll('tbody tr');
+      const tfootRow = table.querySelector('tfoot tr');
+
+      // S.No. column (cell 0)
+      const snoCell = theadRow.cells[0];
+      snoCell.style.position = 'sticky';
+      snoCell.style.left = '0px';
+      snoCell.style.zIndex = 3;
+      const snoWidth = snoCell.offsetWidth || 50;
+
+      // user-defined columns
+      let leftOffset = snoWidth;
+      for (let j = 0; j < userOrder.length; j++) {
+        const th = theadRow.cells[j + 1];
+        const origIndex = parseInt(th.getAttribute('data-col'));
+        if (tbl[origIndex].pinned || tbl[origIndex].frozen) {
+          th.style.position = 'sticky';
+          th.style.left = leftOffset + 'px';
+          th.style.zIndex = 2;
+          leftOffset += tbl[origIndex].width;
+        } else {
+          th.style.position = '';
+          th.style.left = '';
+        }
+      }
+      // Actions header cell (last)
+      const actionCell = theadRow.cells[theadRow.cells.length - 1];
+      actionCell.style.position = 'sticky';
+      actionCell.style.right = '0px';
+      actionCell.style.zIndex = 3;
+
+      // For each row in tbody
+      tbodyRows.forEach(row => {
+        // S.No. cell
+        const snoTd = row.cells[0];
+        snoTd.style.position = 'sticky';
+        snoTd.style.left = '0px';
+        snoTd.style.zIndex = 1;
+
+        let leftOff = snoWidth;
+        for (let j = 0; j < userOrder.length; j++) {
+          const td = row.cells[j + 1];
+          const origIndex = parseInt(td.getAttribute('data-col'));
+          if (tbl[origIndex].pinned || tbl[origIndex].frozen) {
+            td.style.position = 'sticky';
+            td.style.left = leftOff + 'px';
+            td.style.zIndex = 1;
+            leftOff += tbl[origIndex].width;
+          } else {
+            td.style.position = '';
+            td.style.left = '';
+          }
+        }
+        // Actions cell (last)
+        const actTd = row.cells[row.cells.length - 1];
+        actTd.style.position = 'sticky';
+        actTd.style.right = '0px';
+        actTd.style.zIndex = 1;
+      });
+
+      // For tfoot
+      if (tfootRow) {
+        const snoFoot = tfootRow.cells[0];
+        snoFoot.style.position = 'sticky';
+        snoFoot.style.left = '0px';
+        snoFoot.style.zIndex = 1;
+
+        let leftOff = snoWidth;
+        for (let j = 0; j < userOrder.length; j++) {
+          const cell = tfootRow.cells[j + 1];
+          const origIndex = userOrder[j];
+          if (tbl[origIndex].pinned || tbl[origIndex].frozen) {
+            cell.style.position = 'sticky';
+            cell.style.left = leftOff + 'px';
+            cell.style.zIndex = 1;
+            leftOff += tbl[origIndex].width;
+          } else {
+            cell.style.position = '';
+            cell.style.left = '';
+          }
+        }
+        const actFoot = tfootRow.cells[tfootRow.cells.length - 1];
+        actFoot.style.position = 'sticky';
+        actFoot.style.right = '0px';
+        actFoot.style.zIndex = 1;
+      }
+    }
+
+    /******************************************************************
+     * 8) Excel-Like Cell Selection by Mouse Drag
+     ******************************************************************/
+    function handleTableMouseDown(e) {
+      // If the user clicked on an <input>, let them type; skip selection
+      if (e.target.tagName.toLowerCase() === 'input') {
+        return;
+      }
+      if (e.button !== 0) return; // only left mouse button
+      const td = e.target.closest('td[data-col]');
+      if (!td) return; // not a data cell
+      if (!td.parentElement.classList.contains('dataRow')) return; // must be in a data row
+
+      // Clear old selection
+      clearSelection();
+
+      isSelectingCells = true;
+      anchorCell = {
+        rowId: td.getAttribute('data-row'),
+        colId: td.getAttribute('data-col')
+      };
+      selectRange(anchorCell, anchorCell);
+      lastHoverCell = anchorCell;
+
+      // Prevent text highlight or input focus
+      e.preventDefault();
+    }
+
+    function handleTableMouseMove(e) {
+      if (!isSelectingCells) return;
+      const td = e.target.closest('td[data-col]');
+      if (!td) return;
+      if (!td.parentElement.classList.contains('dataRow')) return;
+
+      const cellObj = {
+        rowId: td.getAttribute('data-row'),
+        colId: td.getAttribute('data-col')
+      };
+      if (!cellObj.rowId || !cellObj.colId) return;
+
+      // If we've moved to a new cell, update the selection
+      if (cellObj.rowId !== lastHoverCell?.rowId || cellObj.colId !== lastHoverCell?.colId) {
+        clearSelection();
+        selectRange(anchorCell, cellObj);
+        lastHoverCell = cellObj;
+      }
+    }
+
+    function handleTableMouseUp(e) {
+      if (isSelectingCells) {
+        isSelectingCells = false;
+        anchorCell = null;
+        lastHoverCell = null;
+        updateSelectionSummary();
+      }
+    }
+
+    function handleTableMouseLeave(e) {
+      // If we leave the table area while dragging, end selection
+      if (isSelectingCells) {
+        isSelectingCells = false;
+        anchorCell = null;
+        lastHoverCell = null;
+        updateSelectionSummary();
+      }
+    }
+
+    // Select a rectangular range from cellA to cellB
+    function selectRange(cellA, cellB) {
+      const tbody = document.querySelector('tbody');
+      const allRows = Array.from(tbody.querySelectorAll('tr.dataRow'));
+      const rowA = document.getElementById(cellA.rowId);
+      const rowB = document.getElementById(cellB.rowId);
+      if (!rowA || !rowB) return;
+      const indexA = allRows.indexOf(rowA);
+      const indexB = allRows.indexOf(rowB);
+      if (indexA < 0 || indexB < 0) return;
+
+      const minRow = Math.min(indexA, indexB);
+      const maxRow = Math.max(indexA, indexB);
+
+      const userOrder = getUserColumnOrder();
+      const colA = parseInt(cellA.colId), colB = parseInt(cellB.colId);
+      const idxA = userOrder.indexOf(colA);
+      const idxB = userOrder.indexOf(colB);
+      if (idxA < 0 || idxB < 0) return;
+
+      const minCol = Math.min(idxA, idxB);
+      const maxCol = Math.max(idxA, idxB);
+
+      for (let r = minRow; r <= maxRow; r++) {
+        const rowEl = allRows[r];
+        for (let c = minCol; c <= maxCol; c++) {
+          const origColId = userOrder[c];
+          const td = rowEl.querySelector(`td[data-col="${origColId}"]`);
+          if (td) {
+            const rid = rowEl.id;
+            const key = rid + '_' + origColId;
+            selectedCells.add(key);
+            td.classList.add('selected-cell');
+          }
+        }
+      }
+    }
+
+    function clearSelection() {
+      selectedCells.forEach(key => {
+        const [rid, cid] = key.split('_');
+        const td = document.querySelector(`td[data-row="${rid}"][data-col="${cid}"]`);
+        if (td) td.classList.remove('selected-cell');
+      });
+      selectedCells.clear();
+    }
+
+    function updateSelectionSummary() {
+      const summaryDiv = document.getElementById('selection-summary');
+      if (selectedCells.size === 0) {
+        summaryDiv.style.display = 'none';
+        return;
+      }
+      // Gather values from selected cells
+      const cellValues = [];
+      for (let key of selectedCells) {
+        const [rid, cid] = key.split('_');
+        const td = document.querySelector(`td[data-row="${rid}"][data-col="${cid}"]`);
+        if (td) {
+          const input = td.querySelector('input');
+          const val = input ? input.value.trim() : '';
+          cellValues.push(val);
+        }
+      }
+      const summaryText = computeSummary(cellValues);
+      summaryDiv.textContent = summaryText;
+      summaryDiv.style.display = 'block';
+    }
+
+    /******************************************************************
+     * 9) Summaries for selected cells
+     *    - numeric => sum/avg/count
+     *    - date/time => sum/avg as date/time
+     *    - text => count
+     *    - empty numeric => 0
+     ******************************************************************/
+    function computeSummary(values) {
+      if (values.length === 0) return '';
+      const parsed = values.map(parseCellValue);
+      const types = new Set(parsed.map(p => p.type));
+      if (types.size === 1) {
+        // all same type
+        const t = [...types][0];
+        if (t === 'text') {
+          return `Count: ${values.length}`;
+        } else if (t === 'number') {
+          const nums = parsed.map(p => p.value);
+          const sum = nums.reduce((a,b) => a+b, 0);
+          const avg = nums.length ? (sum / nums.length) : 0;
+          return `Sum: ${sum}, Avg: ${avg.toFixed(2)}, Count: ${nums.length}`;
+        } else if (t === 'date' || t === 'time') {
+          // treat as numeric ms
+          const msArr = parsed.map(p => p.value);
+          const sumMs = msArr.reduce((a,b) => a+b, 0);
+          const avgMs = msArr.length ? sumMs/msArr.length : 0;
+          return `Sum: ${formatDateTime(sumMs)}, Avg: ${formatDateTime(avgMs)}, Count: ${msArr.length}`;
+        } else {
+          return `Count: ${values.length}`;
+        }
+      } else {
+        // Mixed
+        return 'Mixed type';
+      }
+    }
+
+    // parseCellValue => interpret empty numeric as 0, date/time, or text
+    function parseCellValue(str) {
+      if (!str) {
+        // treat as numeric 0
+        return { type:'number', value:0 };
+      }
+      // numeric?
+      const numericRegex = /^\s*-?\d+(\.\d+)?\s*$/;
+      if (numericRegex.test(str)) {
+        const val = parseFloat(str);
+        return { type:'number', value: (isNaN(val) ? 0 : val) };
+      }
+      // date/time?
+      const ms = Date.parse(str);
+      if (!isNaN(ms)) {
+        if (str.includes(':') && !str.includes('/') && !str.includes('-')) {
+          return { type:'time', value: ms };
+        } else {
+          return { type:'date', value: ms };
+        }
+      }
+      return { type:'text', value:str };
+    }
+
+    function formatDateTime(ms) {
+      if (!isFinite(ms)) return '';
+      return new Date(ms).toISOString().slice(0,19).replace('T',' ');
+    }
+
+    /******************************************************************
+     * Initialization
+     ******************************************************************/
+    createTable();
+  </script>
+</body>
+</html>
